@@ -21,6 +21,7 @@ import base64
 import glob
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -56,7 +57,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.19"
+VERSION = "0.4.20"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -9910,10 +9911,24 @@ def completion_star_bar(summary: dict, width: int = 10) -> str:
     fail = int(summary.get("fail", counts.get("fail", 0)) or 0)
     scored = exact + near + fail
     if scored <= 0:
-        return "☆" * width
-    good = exact + near
-    filled = max(0, min(width, int(round((good / scored) * width))))
-    return ("★" * filled) + ("☆" * (width - filled))
+        return "." * width
+
+    buckets = [
+        ("★", exact),
+        ("☆", near),
+        (".", fail),
+    ]
+    raw = [(symbol, value * width / scored) for symbol, value in buckets]
+    sizes = [int(math.floor(amount)) for _symbol, amount in raw]
+    remaining = width - sum(sizes)
+    remainders = sorted(
+        range(len(raw)),
+        key=lambda idx: (raw[idx][1] - sizes[idx], buckets[idx][1]),
+        reverse=True,
+    )
+    for idx in remainders[:remaining]:
+        sizes[idx] += 1
+    return "".join(symbol * size for (symbol, _value), size in zip(buckets, sizes))
 
 
 def format_completion_run_score(run: CompletionStatsRun) -> str:
@@ -10528,8 +10543,8 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
         console.print(
             "[dim]Interpretation: EXACT means the parsed final numeric pair is exactly 72, 46.0. "
             "NEAR means both count and hours are within the configured tolerance; FAIL means the "
-            "answer was unparseable or outside tolerance. The 10-star bar rounds "
-            "(EXACT+NEAR)/scored_runs to ★★★★★★★★★★ scale for quick screenshots.[/dim]"
+            "answer was unparseable or outside tolerance. The 10-slot quality bar is a rounded "
+            "distribution: ★=EXACT, ☆=NEAR, .=FAIL.[/dim]"
         )
     else:
         console.print(
@@ -10891,8 +10906,8 @@ async def run_completion_stats_benchmark(args) -> dict:
                 "correctness": (
                     "The final answer is parsed from the end of the response as two numbers: "
                     "ticket count and hours. EXACT is 72, 46.0; NEAR is within tolerance; "
-                    "FAIL is outside tolerance or unparseable. A 10-star bar rounds the "
-                    "(EXACT+NEAR)/scored_runs ratio for a compact visual score."
+                    "FAIL is outside tolerance or unparseable. The 10-slot quality bar is a "
+                    "rounded distribution: ★=EXACT, ☆=NEAR, .=FAIL."
                     if (profile or {}).get("scorer") == "ledger_lavd" else
                     "By default correctness is scored by applying the regex to the final "
                     "non-empty answer line, matching the GLM dense-MLA vs NSA comparison."
