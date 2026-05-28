@@ -57,7 +57,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.23"
+VERSION = "0.4.24"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -4610,6 +4610,28 @@ def summarize_hardware_history(samples: list[dict]) -> dict:
         "pcie_tx_avg_mb_s": avg("pcie_tx_total_mb_s"),
         "pcie_tx_max_mb_s": maxv("pcie_tx_total_mb_s"),
     }
+
+
+def format_hardware_run_power(summary: dict) -> str:
+    if not summary or not summary.get("samples"):
+        return ""
+    avg_w = float(summary.get("power_total_avg_w", 0.0) or 0.0)
+    max_w = float(summary.get("power_total_max_w", 0.0) or 0.0)
+    limit_w = float(summary.get("power_limit_total_w", 0.0) or 0.0)
+    duration = float(summary.get("duration_seconds", 0.0) or 0.0)
+    samples = int(summary.get("samples", 0) or 0)
+    if avg_w <= 0:
+        return ""
+    parts = [f"avg [bold]{avg_w:,.0f} W[/bold]"]
+    if max_w > 0:
+        parts.append(f"max {max_w:,.0f} W")
+    if limit_w > 0:
+        parts.append(f"limit {limit_w:,.0f} W")
+    if duration > 0:
+        parts.append(f"over {format_time(duration)}")
+    if samples > 0:
+        parts.append(f"{samples:,} samples")
+    return " | ".join(parts)
 
 
 def _diag_command(cmd: list[str], timeout: float = 5.0) -> dict:
@@ -10557,6 +10579,15 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
     if metadata.get("correct_regex"):
         profile_table.add_row("correct regex", metadata.get("correct_regex"))
     console.print(profile_table)
+    power_line = format_hardware_run_power(report.get("hardware_run_summary", {}) or {})
+    if power_line:
+        console.print(Panel(
+            power_line,
+            title=render_title("Whole-run GPU Power"),
+            box=PANEL_BOX,
+            border_style=SUBTLE_BORDER,
+            expand=False,
+        ))
     console.print(completion_stats_table_rows(report["level_summaries"]))
 
     selected = report["selected_summary"]
@@ -10953,6 +10984,7 @@ async def run_completion_stats_benchmark(args) -> dict:
             "all_summary": all_summary,
             "level_summaries": level_summaries,
             "wrong_runs": wrong_runs,
+            "hardware_run_summary": summarize_hardware_history(hw_state.hw_history),
             "runs": [
                 asdict(r) if args.completion_stats_save_text else {
                     **asdict(r),
@@ -12063,6 +12095,7 @@ async def run_benchmark(args):
                     state.cell_running = False
                     state.prefill_phase = False
                     live.update(build_display(state))
+                    setattr(args, "hardware_run_summary", summarize_hardware_history(state.hw_history))
                     return all_results, burst_results, state.prefill_results, engine
 
             # === Warmup probe: ensure CUDA graphs / JIT compiled before decode ===
@@ -12350,6 +12383,7 @@ async def run_benchmark(args):
                     await asyncio.sleep(1.0)
 
     setattr(args, "event_log", list(state.events))
+    setattr(args, "hardware_run_summary", summarize_hardware_history(state.hw_history))
     return all_results, burst_results, state.prefill_results, engine
 
 
@@ -12360,7 +12394,8 @@ async def run_benchmark(args):
 def print_final_results(results: list, concurrency_levels: list, context_lengths: list,
                         console: Console, prefill_results: dict = None,
                         show_capacity_limited_values: bool = False,
-                        burst_results: list = None):
+                        burst_results: list = None,
+                        hardware_run_summary: dict = None):
     console.print("\n")
     console.print(f"[dim]llm-decode-bench v{VERSION}[/dim]")
 
@@ -12688,9 +12723,20 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 f"{hw.get('pcie_rx_avg_mb_s', 0):.0f}/{hw.get('pcie_tx_avg_mb_s', 0):.0f}",
             )
         console.print(hw_table)
+        power_line = format_hardware_run_power(hardware_run_summary or {})
+        if power_line:
+            console.print(Panel(
+                power_line,
+                title=render_title("Whole-run GPU Power"),
+                box=PANEL_BOX,
+                border_style=SUBTLE_BORDER,
+                expand=False,
+            ))
         console.print(
             "[dim]Hardware summary is sampled from nvidia-smi during the measured part of each cell. "
-            "PCIe rx/tx is MB/s and is a coarse live diagnostic, not a per-kernel NCCL profiler.[/dim]"
+            "Whole-run GPU power is the sampled sum of GPU power draw across the complete benchmark run, "
+            "not wall-outlet system power. PCIe rx/tx is MB/s and is a coarse live diagnostic, "
+            "not a per-kernel NCCL profiler.[/dim]"
         )
 
     if burst_results:
@@ -12968,6 +13014,7 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
         "nvidia_p2p_override": getattr(args, "nvidia_p2p_override", {}),
         "p2pmark": getattr(args, "p2pmark_result", {}),
         "amd_fabric": getattr(args, "amd_fabric_result", {}),
+        "hardware_run_summary": getattr(args, "hardware_run_summary", {}),
         "event_log": getattr(args, "event_log", []),
         "prefill": prefill_summary,
         "results": [asdict(r) for r in actual_results],
@@ -13818,6 +13865,7 @@ def main():
             prefill_results,
             show_capacity_limited_values=args.show_capacity_limited_values,
             burst_results=burst_results,
+            hardware_run_summary=getattr(args, "hardware_run_summary", {}),
         )
         save_results(results, args, args.output, prefill_results, engine=engine, burst_results=burst_results)
         console.print(f"\n[green]Results saved to {args.output}[/green]")
