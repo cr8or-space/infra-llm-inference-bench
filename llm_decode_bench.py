@@ -18,8 +18,10 @@ Usage:
 import argparse
 import asyncio
 import base64
+import csv
 import glob
 import hashlib
+import io
 import json
 import math
 import os
@@ -35,6 +37,7 @@ import termios
 import threading
 import time
 import tty
+import zipfile
 import zlib
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -58,7 +61,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.25"
+VERSION = "0.4.26"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -3981,6 +3984,57 @@ BENCH_DATASETS = {
             "1000-question subset (largest-remainder per category, floor-stride by question_id)"
         ),
     },
+    "gpqa_diamond": {
+        "filename": "gpqa_diamond.jsonl",
+        # The GPQA authors distribute the dataset as a password-protected zip and
+        # ask that the plaintext never be republished online (anti-contamination).
+        # The password below is documented in the official README for legitimate
+        # use; the derived JSONL is cached locally only and must NOT be committed.
+        "archive_url": "https://github.com/idavidrein/gpqa/raw/main/dataset.zip",
+        "archive_sha256": "461ae7329f15a3e35f8184d2dac24b990f34fdf12f366ca4062d8e6638cd08dc",
+        "archive_member": "dataset/gpqa_diamond.csv",
+        "archive_password": "deserted-untie-orchid",
+        "builder": "gpqa_diamond",
+        "sha256": "a8472c5a82ea2df8f209c17713aba1a6d409120c609ec0582dae0cb940c7e28c",
+        "expected_items": 198,
+        "source": (
+            "idavidrein/gpqa dataset.zip diamond split (CC BY 4.0), options shuffled "
+            "deterministically per item (random.Random seeded by record id)"
+        ),
+    },
+}
+
+
+def _build_gpqa_diamond_jsonl(csv_bytes: bytes) -> bytes:
+    """Deterministic canonical JSONL from the official gpqa_diamond.csv."""
+    rows = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))
+    out_lines = []
+    for row_index, row in enumerate(rows):
+        record_id = str(row.get("Record ID") or "").strip()
+        question = str(row.get("Question") or "").strip()
+        correct = str(row.get("Correct Answer") or "").strip()
+        incorrect = [str(row.get(f"Incorrect Answer {i}") or "").strip() for i in (1, 2, 3)]
+        domain = str(row.get("High-level domain") or "").strip()
+        subdomain = str(row.get("Subdomain") or "").strip()
+        if not record_id or not question or not correct or not all(incorrect) or not domain:
+            raise RuntimeError(f"GPQA diamond CSV row {row_index} is malformed")
+        options = [correct] + incorrect
+        random.Random(f"gpqa-diamond-{record_id}").shuffle(options)
+        answer_index = options.index(correct)
+        out_lines.append(json.dumps({
+            "record_id": record_id,
+            "category": domain,
+            "subdomain": subdomain,
+            "question": question,
+            "options": options,
+            "answer": MC_OPTION_LETTERS[answer_index],
+            "answer_index": answer_index,
+        }, sort_keys=True, ensure_ascii=True, separators=(",", ":")))
+    return ("\n".join(out_lines) + "\n").encode("utf-8")
+
+
+BENCH_DATASET_BUILDERS = {
+    "gpqa_diamond": _build_gpqa_diamond_jsonl,
 }
 
 GSM8K_PROMPT_SUFFIX = (
@@ -4026,7 +4080,50 @@ def resolve_benchmark_dataset(dataset_name: str, console: Optional[Console] = No
                 return path, digest
             problems.append(f"{path}: sha256 mismatch (expected {expected_sha[:16]}…, got {digest[:16]}…)")
     os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
-    for url in spec["urls"]:
+    archive_url = str(spec.get("archive_url") or "")
+    if archive_url:
+        if console is not None:
+            console.print(
+                f"[cyan]Downloading pinned dataset archive for {dataset_name} "
+                f"from {archive_url} ...[/cyan]"
+            )
+        try:
+            with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(180.0, connect=30.0)) as client:
+                resp = client.get(archive_url)
+                resp.raise_for_status()
+                archive_blob = resp.content
+            archive_digest = hashlib.sha256(archive_blob).hexdigest()
+            expected_archive_sha = str(spec.get("archive_sha256") or "")
+            if expected_archive_sha and archive_digest != expected_archive_sha:
+                raise RuntimeError(
+                    f"archive sha256 mismatch (expected {expected_archive_sha[:16]}…, "
+                    f"got {archive_digest[:16]}…)"
+                )
+            member = str(spec.get("archive_member") or "")
+            password = str(spec.get("archive_password") or "")
+            with zipfile.ZipFile(io.BytesIO(archive_blob)) as archive:
+                member_bytes = archive.read(member, pwd=password.encode("utf-8") if password else None)
+            builder = BENCH_DATASET_BUILDERS[str(spec.get("builder") or "")]
+            blob = builder(member_bytes)
+            digest = hashlib.sha256(blob).hexdigest()
+            if digest != expected_sha:
+                raise RuntimeError(
+                    f"built dataset sha256 mismatch (expected {expected_sha[:16]}…, "
+                    f"got {digest[:16]}…)"
+                )
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "wb") as fh:
+                fh.write(blob)
+            os.replace(tmp_path, cache_path)
+            if console is not None:
+                console.print(
+                    f"[green]Dataset {dataset_name} extracted, verified, and cached "
+                    f"at {cache_path}[/green]"
+                )
+            return cache_path, digest
+        except Exception as exc:
+            problems.append(f"{archive_url}: {type(exc).__name__}: {exc}")
+    for url in spec.get("urls") or []:
         if console is not None:
             console.print(f"[cyan]Downloading pinned dataset {dataset_name} from {url} ...[/cyan]")
         try:
@@ -4103,6 +4200,24 @@ def load_benchmark_dataset_items(
             )
             items.append({
                 "item_id": f"mmlupro-{int(row.get('question_id') or idx)}",
+                "category": str(row.get("category") or ""),
+                "prompt": MMLU_PRO_PROMPT_TEMPLATE.format(question=question, options=options_text),
+                "expected_answer": answer,
+                "expected_letter": answer,
+                "num_options": len(options),
+            })
+    elif dataset_name == "gpqa_diamond":
+        for idx, row in enumerate(rows):
+            question = str(row.get("question") or "").strip()
+            options = [str(o) for o in (row.get("options") or [])]
+            answer = str(row.get("answer") or "").strip().upper()
+            if not question or len(options) != 4 or answer not in MC_OPTION_LETTERS[:4]:
+                raise RuntimeError(f"Dataset {dataset_name} row {idx} is malformed")
+            options_text = "\n".join(
+                f"{MC_OPTION_LETTERS[i]}. {opt}" for i, opt in enumerate(options)
+            )
+            items.append({
+                "item_id": f"gpqa-{str(row.get('record_id') or idx)}",
                 "category": str(row.get("category") or ""),
                 "prompt": MMLU_PRO_PROMPT_TEMPLATE.format(question=question, options=options_text),
                 "expected_answer": answer,
@@ -4280,6 +4395,25 @@ BUILTIN_TEST_PROFILES = {
         "default_runs": 0,
         "default_no_prefill_scout": True,
     },
+    "gpqa-diamond": {
+        "description": (
+            "GPQA Diamond accuracy benchmark: all 198 graduate-level 'Google-proof' "
+            "science questions (biology, chemistry, physics), 4 options per question "
+            "with a deterministic per-item shuffle, scored by exact option-letter "
+            "match. Frontier-difficulty anchor for quantization A/B tests; the small "
+            "item count limits statistical resolution, so read it alongside gsm8k "
+            "and mmlu-pro. Dataset is fetched from the official password-protected "
+            "zip on first use and cached locally; it is never stored in this repo."
+        ),
+        "dataset": "gpqa_diamond",
+        "scorer": "dataset_mc_letter",
+        "score_source": "final_answer",
+        "default_max_tokens": 32768,
+        "default_temperature": 0.0,
+        "default_concurrency": 30,
+        "default_runs": 0,
+        "default_no_prefill_scout": True,
+    },
 }
 
 BUILTIN_TEST_PROFILE_ALIASES = {
@@ -4290,6 +4424,8 @@ BUILTIN_TEST_PROFILE_ALIASES = {
     "gsm-8k": "gsm8k",
     "mmlupro": "mmlu-pro",
     "mmlu-pro-1000": "mmlu-pro",
+    "gpqa": "gpqa-diamond",
+    "gpqa_diamond": "gpqa-diamond",
 }
 
 METRIC_RE = re.compile(r'^((?:sglang|vllm):\w+)(?:\{([^}]*)\})?\s+([\d.eE+-]+)')
@@ -10795,6 +10931,7 @@ def render_completion_stats_display(state: dict) -> Panel:
         "Hotel Lights Test" if state.get("profile") == "hotel-lights" else
         "GSM8K Accuracy" if state.get("profile") == "gsm8k" else
         "MMLU-Pro Accuracy" if state.get("profile") == "mmlu-pro" else
+        "GPQA Diamond Accuracy" if state.get("profile") == "gpqa-diamond" else
         "Completion Token Stats"
     )
     return Panel(
@@ -11059,6 +11196,13 @@ def print_completion_stats_results(report: dict, console: Console) -> None:
         "Wilson 95% interval is the headline metric; completion tokens show reasoning "
         "cost. Use --compare-baseline for paired A/B comparison across quantizations. "
     ) if scorer == "dataset_gsm8k" else (
+        "[bold]GPQA Diamond Accuracy Benchmark[/bold]\n"
+        "Every request is a different graduate-level 'Google-proof' science question "
+        "(198 items; biology, chemistry, physics; 4 options with a deterministic "
+        "per-item shuffle), scored by exact option-letter match. Frontier-difficulty "
+        "anchor; note the small item count limits statistical resolution — read it "
+        "alongside gsm8k and mmlu-pro. Use --compare-baseline for paired A/B comparison. "
+    ) if str(metadata.get("test_profile") or "") == "gpqa-diamond" else (
         "[bold]MMLU-Pro Accuracy Benchmark[/bold]\n"
         "Every request is a different question from the pinned stratified 1000-question "
         "MMLU-Pro subset (multiple choice, up to 10 options), scored by exact option-letter "
@@ -11981,6 +12125,7 @@ async def run_completion_stats_benchmark(args) -> dict:
             "methodology": {
                 "name": (
                     "GSM8K accuracy benchmark" if (profile or {}).get("scorer") == "dataset_gsm8k" else
+                    "GPQA Diamond accuracy benchmark" if profile_name == "gpqa-diamond" else
                     "MMLU-Pro accuracy benchmark" if (profile or {}).get("scorer") == "dataset_mc_letter" else
                     "LAVD context consistency test" if (profile or {}).get("scorer") == "ledger_lavd" else
                     "Completion-token statistics"
@@ -12020,10 +12165,10 @@ async def run_completion_stats_benchmark(args) -> dict:
                     "over scored items with a Wilson 95% interval. Runs are paired per item "
                     "across configurations via --compare-baseline."
                     if (profile or {}).get("scorer") == "dataset_gsm8k" else
-                    "Each request is scored against its own pinned dataset item. MMLU-Pro: the "
-                    "chosen option letter is extracted from an 'Answer: X' tag on the final "
-                    "line (falling back to a bare final-line letter, then the last answer tag "
-                    "in the visible text) and must match the reference letter. Headline metric "
+                    "Each request is scored against its own pinned dataset item. The chosen "
+                    "option letter is extracted from an 'Answer: X' tag on the final line "
+                    "(falling back to a bare final-line letter, then the last answer tag in "
+                    "the visible text) and must match the reference letter. Headline metric "
                     "is accuracy over scored items with a Wilson 95% interval, plus "
                     "per-category accuracy. Runs are paired per item across configurations "
                     "via --compare-baseline."
@@ -14475,9 +14620,10 @@ def parse_args():
             "lavd-test is a context consistency test: arithmetic any model can do, but the model must "
             "find human errors in long structured data and understand how to repair them before computing "
             "ticket count and hours. "
-            "gsm8k and mmlu-pro are pinned multi-item accuracy benchmarks (1319 math problems / "
-            "1000 stratified multiple-choice questions, one item per request, temperature 0) intended "
-            "for quantization A/B comparisons via --compare-baseline. Setting this implies --completion-stats."
+            "gsm8k, mmlu-pro, and gpqa-diamond are pinned multi-item accuracy benchmarks (1319 math "
+            "problems / 1000 stratified multiple-choice questions / 198 graduate-level science questions, "
+            "one item per request, temperature 0) intended for quantization A/B comparisons via "
+            "--compare-baseline. Setting this implies --completion-stats."
         )
     )
     parser.add_argument(
@@ -15122,6 +15268,7 @@ def main():
             "Hotel Lights Reasoning Test" if args.test_profile == "hotel-lights" else
             "GSM8K Accuracy Benchmark" if args.test_profile == "gsm8k" else
             "MMLU-Pro Accuracy Benchmark" if args.test_profile == "mmlu-pro" else
+            "GPQA Diamond Accuracy Benchmark" if args.test_profile == "gpqa-diamond" else
             "Completion Token Statistics Benchmark"
         )
         score_label = (
@@ -15131,7 +15278,7 @@ def main():
             if profile_config.get("scorer") == "numeric_exact" else
             "per-item final number vs GSM8K reference"
             if profile_config.get("scorer") == "dataset_gsm8k" else
-            "per-item option letter vs MMLU-Pro reference"
+            "per-item option letter vs dataset reference"
             if profile_config.get("scorer") == "dataset_mc_letter" else
             (args.completion_stats_correct_regex or "disabled")
         )

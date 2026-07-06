@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.26 - 2026-07-06
+
+### GPQA Diamond profile
+
+- Added `--test-profile gpqa-diamond` (aliases `gpqa`, `gpqa_diamond`): all 198 graduate-level GPQA Diamond science questions (CC BY 4.0) as a frontier-difficulty accuracy anchor, scored by exact option-letter match with per-category (biology/chemistry/physics) accuracy and the same paired `--compare-baseline` support as gsm8k/mmlu-pro.
+- Options are assigned to letters by a deterministic per-item shuffle seeded by the GPQA record id, so letter assignments and item ids are identical on every machine and across runs.
+- Respecting the GPQA anti-contamination terms, the dataset is never stored in this repository: the official password-protected `dataset.zip` is downloaded from `idavidrein/gpqa` on first use, the archive and the derived canonical JSONL are both sha256-pinned, and the JSONL is cached under `~/.cache/llm_decode_bench/datasets/` only. A `.gitignore` entry guards against committing a local copy.
+- Defaults match the other dataset profiles: temperature 0, `max_tokens` 32768, fixed concurrency 30, all 198 items (deterministic evenly-spread subset via `--profile-runs N`).
+
 ## 0.4.25 - 2026-07-06
 
 ### Dataset accuracy profiles and paired comparison

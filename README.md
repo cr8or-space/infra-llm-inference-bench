@@ -23,7 +23,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
 - **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
-- **Dataset accuracy profiles** — pinned GSM8K (1319 items) and stratified MMLU-Pro (1000 items) benchmarks with per-item scoring, Wilson confidence intervals, and per-category accuracy, designed to measure quantization degradation (e.g. NVFP4 w4a16 vs w4a4)
+- **Dataset accuracy profiles** — pinned GSM8K (1319 items), stratified MMLU-Pro (1000 items), and GPQA Diamond (198 items) benchmarks with per-item scoring, Wilson confidence intervals, and per-category accuracy, designed to measure quantization degradation (e.g. NVFP4 w4a16 vs w4a4)
 - **Paired A/B comparison** — `--compare-baseline` pairs two runs per item and reports accuracy delta, correct/wrong flips, exact McNemar significance, per-category deltas, and completion-token inflation
 - **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
 - **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
@@ -98,6 +98,11 @@ python3 llm_decode_bench.py --port 8001 --model GLM-5 \
 # MMLU-Pro accuracy benchmark (pinned stratified 1000-question subset)
 python3 llm_decode_bench.py --port 8001 --model GLM-5 \
     --test-profile mmlu-pro
+
+# GPQA Diamond accuracy benchmark (198 graduate-level science questions;
+# fetched from the official password-protected zip on first use, cached locally)
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile gpqa-diamond
 
 # Quantization A/B: run the baseline quant first, then the candidate with a
 # paired per-item comparison (accuracy delta, flips, exact McNemar p-value)
@@ -354,14 +359,15 @@ budget, pass `--dcp-size N` or set `LLM_BENCH_DCP_SIZE=N`. For example, a local
 `max_total_num_tokens=200000` with `--dcp-size 4` is displayed and treated as an
 effective `800000` token KV budget.
 
-### Dataset Accuracy Profiles (gsm8k, mmlu-pro)
+### Dataset Accuracy Profiles (gsm8k, mmlu-pro, gpqa-diamond)
 
-`--test-profile gsm8k` and `--test-profile mmlu-pro` are multi-item accuracy
-benchmarks built on the completion-stats machinery. Instead of repeating one
-prompt, every measured request is a **different pinned dataset item**, so the
-reported correctness rate is dataset accuracy, not a resample pass-rate. They
-are intended as sensitive, externally comparable anchors for quantization and
-engine A/B tests (for example NVFP4 `w4a16` vs `w4a4` of the same checkpoint).
+`--test-profile gsm8k`, `--test-profile mmlu-pro`, and `--test-profile
+gpqa-diamond` are multi-item accuracy benchmarks built on the completion-stats
+machinery. Instead of repeating one prompt, every measured request is a
+**different pinned dataset item**, so the reported correctness rate is dataset
+accuracy, not a resample pass-rate. They are intended as sensitive, externally
+comparable anchors for quantization and engine A/B tests (for example NVFP4
+`w4a16` vs `w4a4` of the same checkpoint).
 
 Datasets are pinned by sha256 and resolved in this order: `data/<file>` next to
 the script, `~/.cache/llm_decode_bench/datasets/`, then download from the pinned
@@ -383,8 +389,21 @@ can never silently measure different item sets.
   tolerant extraction (bold/parenthesised tags, bare final-line letters,
   last-tag-wins fallback in the visible text). The report includes
   per-category accuracy.
+- `gpqa-diamond` — all 198 graduate-level "Google-proof" science questions of
+  the GPQA Diamond split (CC BY 4.0; biology, chemistry, physics), 4 options
+  per question assigned by a deterministic per-item shuffle (seeded by record
+  id, identical on every machine), same `Answer: <letter>` scoring as
+  `mmlu-pro`. This is the frontier-difficulty anchor; with only 198 items its
+  statistical resolution is coarse (~±5 pp paired), so read it alongside
+  `gsm8k` and `mmlu-pro`. The GPQA authors distribute the dataset as a
+  password-protected zip and ask that plaintext never be republished online
+  (anti-contamination), so this dataset is **not** shipped in `data/`: the
+  official zip is downloaded on first use (both the archive and the derived
+  JSONL are sha256-pinned) and cached under
+  `~/.cache/llm_decode_bench/datasets/` only. `.gitignore` guards against
+  committing a local copy; please keep it out of public repos.
 
-Both profiles default to temperature 0, `max_tokens` 32768 (matching common
+All dataset profiles default to temperature 0, `max_tokens` 32768 (matching common
 reasoning-model eval budgets, so a healthy baseline essentially never
 truncates; override with `--max-tokens`), fixed concurrency 30, no
 prefix-cache scout (prompts are unique), and **all dataset items**.
