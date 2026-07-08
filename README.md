@@ -403,11 +403,13 @@ can never silently measure different item sets.
   `~/.cache/llm_decode_bench/datasets/` only. `.gitignore` guards against
   committing a local copy; please keep it out of public repos.
 
-All dataset profiles default to temperature 0, `max_tokens` 65536 (a generous
+All dataset profiles default to temperature 0, `max_tokens` 131072 (a generous
 reasoning budget so a healthy baseline essentially never truncates and
 candidate `max_tokens` hits read as degradation; override with
 `--max-tokens`), fixed concurrency 30, no prefix-cache scout (prompts are
-unique), and **all dataset items**.
+unique), and **all dataset items**. If your server's `max_model_len` is at or
+below 128k, engines like vLLM reject requests whose prompt + `max_tokens`
+exceed the context window — pass a smaller `--max-tokens` in that case.
 `--profile-runs N` selects a deterministic evenly-spread N-item subset — the
 same N items every run, so subsets stay comparable across configurations.
 Item-level results (`item_id`, expected/parsed answer, per-item correctness,

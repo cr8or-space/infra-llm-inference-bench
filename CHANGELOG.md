@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.28 - 2026-07-08
+
+### Dataset profile defaults
+
+- Raised the default `max_tokens` of the dataset accuracy profiles (`gsm8k`, `mmlu-pro`, `gpqa-diamond`) from 65536 to 131072. Note that engines such as vLLM reject requests whose prompt plus `max_tokens` exceed the server `max_model_len`; on servers configured at or below 128k context, pass an explicit smaller `--max-tokens`.
+
 ## 0.4.27 - 2026-07-08
 
 ### Dataset profile defaults
