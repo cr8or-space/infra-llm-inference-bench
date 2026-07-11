@@ -12919,34 +12919,37 @@ async def run_benchmark(args):
         t0 = time.monotonic()
         ttft = None
         prompt_tokens = None
-        try:
-            async with client.stream(
-                "POST", f"{base_url}/v1/chat/completions",
-                json=payload,
-                timeout=httpx.Timeout(600.0, connect=30.0),
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    # Capture usage (comes in final chunk)
-                    usage = data.get("usage")
-                    if usage and "prompt_tokens" in usage:
-                        prompt_tokens = usage["prompt_tokens"]
-                    if ttft is None and "choices" in data and len(data["choices"]) > 0:
-                        delta = data["choices"][0].get("delta", {})
-                        if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
-                            ttft = time.monotonic() - t0
-        except Exception:
-            pass
+        async with client.stream(
+            "POST", f"{base_url}/v1/chat/completions",
+            json=payload,
+            timeout=httpx.Timeout(600.0, connect=30.0),
+        ) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread()).decode("utf-8", "replace")[:500]
+                raise RuntimeError(
+                    f"prefill request failed with HTTP {resp.status_code}: {body}"
+                )
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                # Capture usage (comes in final chunk)
+                usage = data.get("usage")
+                if usage and "prompt_tokens" in usage:
+                    prompt_tokens = usage["prompt_tokens"]
+                if ttft is None and "choices" in data and len(data["choices"]) > 0:
+                    delta = data["choices"][0].get("delta", {})
+                    if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
+                        ttft = time.monotonic() - t0
         if ttft is None:
-            ttft = time.monotonic() - t0
+            raise RuntimeError("prefill response ended before the first output token")
         return ttft, prompt_tokens
 
     async def measure_prefill_scout_only(client, ctx: int, live) -> None:
